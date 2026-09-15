@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "ClinkAI 本地 Agent Harness",
+    "subtitle": "本地 + 隐私 + 零依赖 · Node ≥22 原生 TS · 唯一出网路径是本地模型端点",
+    "locale": "zh-CN",
+    "output": "clinkai-architecture.html",
+    "quality_profile": "showcase",
+    "views": [
+      {
+        "id": "core-path",
+        "label": "核心请求路径",
+        "focus": ["cli", "loop", "model", "session"],
+        "note": "任务进入有界循环，流式调用本地模型，轨迹 append-only 落盘。"
+      },
+      {
+        "id": "tool-governance",
+        "label": "工具与治理",
+        "focus": ["loop", "tools", "policy", "ext"],
+        "note": "六件套工具经参数校验与策略闸门；扩展工具进程内注册。"
+      },
+      {
+        "id": "optin-units",
+        "label": "显式启用的能力单元",
+        "focus": ["memory", "delegate", "goal", "loop"],
+        "note": "记忆注入自动；delegate / goal / tools-ext 默认关闭、显式开启。"
+      }
+    ],
+    "legend": { "mode": "auto" }
+  },
+  "components": [
+    { "id": "goal", "type": "backend", "label": "goal", "sublabel": "有界续跑（opt-in）", "pos": [260, 100], "size": [140, 64] },
+    { "id": "compress", "type": "backend", "label": "上下文压缩", "sublabel": "预算 + 归档摘要", "pos": [480, 100], "size": [140, 64] },
+    { "id": "session", "type": "database", "label": "会话 JSONL", "sublabel": "append-only 轨迹", "pos": [700, 100], "size": [140, 60] },
+    { "id": "cli", "type": "frontend", "label": "CLI 入口", "sublabel": "bin/clinkai.ts", "pos": [40, 280], "size": [130, 64] },
+    { "id": "loop", "type": "backend", "label": "Agent Loop", "sublabel": "有界轮次 + 熔断", "pos": [260, 280], "size": [140, 64] },
+    { "id": "model", "type": "external", "label": "本地模型", "sublabel": "llama.cpp :18080", "pos": [920, 280], "size": [150, 64] },
+    { "id": "memory", "type": "database", "label": "MEMORY.md", "sublabel": "长期记忆注入", "pos": [40, 460], "size": [130, 60] },
+    { "id": "tools", "type": "backend", "label": "工具注册表", "sublabel": "read/write/edit/ls/grep/bash", "pos": [260, 460], "size": [140, 60] },
+    { "id": "policy", "type": "security", "label": "策略闸门", "sublabel": "围栏 + 白名单（fail-safe）", "pos": [480, 460], "size": [140, 60] },
+    { "id": "delegate", "type": "backend", "label": "delegate", "sublabel": "子代理（opt-in）", "pos": [40, 640], "size": [130, 60] },
+    { "id": "ext", "type": "backend", "label": "tools-ext", "sublabel": "本地 .mjs（opt-in）", "pos": [260, 640], "size": [140, 60] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "用户本机 · 私有域（0 运行时依赖 · 无遥测）", "wraps": ["goal", "compress", "session", "cli", "loop", "model", "memory", "tools", "policy", "delegate", "ext"], "pad": 24 }
+  ],
+  "connections": [
+    { "id": "cli-to-loop", "from": "cli", "to": "loop", "label": "任务 + 配置", "variant": "emphasis" },
+    { "id": "loop-to-model", "from": "loop", "to": "model", "label": "SSE 流式 · 唯一出网", "variant": "emphasis", "labelAt": [830, 312] },
+    { "id": "goal-to-loop", "from": "goal", "to": "loop", "label": "有界续跑（opt-in）", "variant": "dashed", "labelAt": [330, 178] },
+    { "id": "loop-to-compress", "from": "loop", "to": "compress", "label": "预算 / 摘要" },
+    { "id": "loop-to-session", "from": "loop", "to": "session", "label": "append 轨迹", "labelAt": [500, 296] },
+    { "id": "session-to-loop", "from": "session", "to": "loop", "label": "--resume 继承", "variant": "dashed", "labelAt": [720, 220] },
+    { "id": "loop-to-tools", "from": "loop", "to": "tools", "label": "工具调用 · validateArgs", "labelAt": [330, 358] },
+    { "id": "tools-to-policy", "from": "tools", "to": "policy", "label": "执行前闸门", "variant": "security" },
+    { "id": "ext-to-tools", "from": "ext", "to": "tools", "label": "注册扩展工具（opt-in）", "variant": "dashed" },
+    { "id": "memory-to-loop", "from": "memory", "to": "loop", "label": "注入系统提示词", "variant": "dashed", "labelAt": [140, 410] },
+    { "id": "delegate-to-loop", "from": "delegate", "to": "loop", "label": "子代理（opt-in）", "variant": "dashed", "labelAt": [140, 600] }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "核心循环", "items": ["有界轮次 · repeat/failure 熔断 3/3 · length 续写 ≤2", "判断与正确性分离：模型判断，harness 保正确"] },
+    { "dot": "emerald", "title": "工具与治理", "items": ["内置六件套 + 极小 JSON Schema 参数校验", "工作区围栏 · bash 白名单 · 非 TTY 自动拒绝"] },
+    { "dot": "violet", "title": "显式启用的能力单元", "items": ["MEMORY.md 记忆注入（工作区文件即启用）", "delegate 子代理 / goal 续跑 / tools-ext 扩展工具（默认关闭）"] },
+    { "dot": "rose", "title": "隐私不变量（gate 守护）", "items": ["0 运行时依赖 · 无 node:net/dns/tls · 无遥测字样", "默认端点回环 · 会话 JSONL 本地 append-only 可审计"] }
+  ]
+}

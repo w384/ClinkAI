@@ -1,0 +1,12 @@
+# 依赖（本机安装即可，不入库）
+node_modules/
+
+# 运行时产物（会话/工具输出，均为 append-only 数据，不入库）
+.clinkai/
+.clinkai-bash/
+eval/sessions/
+
+# 本机杂项
+.npm-cache/
+.probe/
+*.log

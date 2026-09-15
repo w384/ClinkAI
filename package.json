@@ -1,0 +1,23 @@
+{
+  "name": "clinkai",
+  "version": "0.1.0",
+  "description": "ClinkAI —— 最小可行 Agent Harness：本机 + 本地 llama.cpp（OpenAI 兼容），零运行时依赖",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "clinkai": "bin/clinkai.ts"
+  },
+  "engines": {
+    "node": ">=23.6"
+  },
+  "scripts": {
+    "doctor": "node bin/clinkai.ts --doctor",
+    "test": "node test/run-tests.ts",
+    "eval": "node eval/run-eval.ts",
+    "web": "node web/server.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^7.0.2"
+  }
+}
