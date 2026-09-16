@@ -1,6 +1,6 @@
 // compress.ts 的离线单测：截断、token 估算（纯函数，无需模型/网络）。
 import { test } from "./harness.ts";
-import { truncateMiddle, estimateTokens, estimateMessagesTokens } from "../src/compress.ts";
+import { truncateMiddle, estimateTokens, estimateMessagesTokens, findSafeArchiveBoundary } from "../src/compress.ts";
 
 test("truncateMiddle：未超阈值原样返回", (t) => {
   const r = truncateMiddle("hello world", 100);
@@ -47,4 +47,59 @@ test("estimateMessagesTokens：计入 tool_calls 的参数", (t) => {
   t.assert(withTools > plain, "带工具调用的估算应大于纯文本");
   // assistant 空正文 + name("read"=1) + arguments(16 字符=4) = 5
   t.eq(withTools, 5);
+});
+
+// ── 压缩安全边界（不拆 assistant tool_calls 与 tool 结果，行业共识）──
+
+test("findSafeArchiveBoundary：期望点非 tool → 原样返回", (t) => {
+  // 下标 0=system；下标 4 是 assistant（非 tool）→ 切割点无需调整
+  const msgs = [
+    { role: "user", content: "sys" },
+    { role: "user", content: "a" },
+    { role: "assistant", content: "b" },
+    { role: "user", content: "c" },
+    { role: "assistant", content: "d" },
+  ];
+  t.eq(findSafeArchiveBoundary(msgs, 4), 4, "期望点非 tool 应原样");
+});
+
+test("findSafeArchiveBoundary：期望点落在 tool 结果 → 回退到其 assistant 之前", (t) => {
+  // 下标 2=assistant(tool_calls)，下标 3=tool 结果
+  // desiredCut=3 落在 tool 上 → 回退到 2（assistant，非 tool）→ tool 对完整保留
+  const msgs = [
+    { role: "user", content: "sys" },
+    { role: "user", content: "a" },
+    { role: "assistant", content: "", tool_calls: [{ id: "x", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", content: "result1", tool_call_id: "x" },
+    { role: "assistant", content: "b" },
+  ];
+  t.eq(findSafeArchiveBoundary(msgs, 3), 2, "tool 对不得被拆开");
+});
+
+test("findSafeArchiveBoundary：连续多个 tool 结果 → 回退到整组 assistant 之前", (t) => {
+  // 下标 2=assistant(两次 tool_calls)，下标 3、4=两个 tool 结果
+  // desiredCut=4 落在 tool 上 → 回退 3（tool）→ 回退 2（assistant，非 tool）
+  const msgs = [
+    { role: "user", content: "sys" },
+    { role: "user", content: "a" },
+    { role: "assistant", content: "", tool_calls: [
+        { id: "x", type: "function", function: { name: "read", arguments: "{}" } },
+        { id: "y", type: "function", function: { name: "ls", arguments: "{}" } },
+      ] },
+    { role: "tool", content: "r1", tool_call_id: "x" },
+    { role: "tool", content: "r2", tool_call_id: "y" },
+    { role: "assistant", content: "b" },
+  ];
+  t.eq(findSafeArchiveBoundary(msgs, 4), 2, "整组 tool 对不得被拆开");
+});
+
+test("findSafeArchiveBoundary：期望点 <1 → 夹到 1（system 永不归档）", (t) => {
+  // desiredCut=0 → 夹到 1；下标 1 虽是 tool 但 c=1 不满足 c>1，停在 1
+  const msgs = [
+    { role: "user", content: "sys" },
+    { role: "tool", content: "r" },
+    { role: "user", content: "c" },
+  ];
+  t.eq(findSafeArchiveBoundary(msgs, 0), 1, "system 永远不被归档");
+  t.eq(findSafeArchiveBoundary(msgs, -5), 1, "负值同样夹到 1");
 });

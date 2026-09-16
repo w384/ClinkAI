@@ -6,21 +6,30 @@ import { truncateMiddle } from "../compress.ts";
 
 /**
  * 解析模型给的路径并完成授权（工作区外会触发确认）。
+ * @param kind 操作类型：read=只读（默认）；write=写入（write/edit 传 write，read-only 档会拒绝）
  * @returns 绝对路径；被拒绝时 ok=false（调用方把拒绝原因回填给模型）
  */
-export async function resolveInWorkspace(ctx: ToolContext, p: string): Promise<{ ok: boolean; abs?: string; text?: string }> {
+export async function resolveInWorkspace(ctx: ToolContext, p: string, kind: "read" | "write" = "read"): Promise<{ ok: boolean; abs?: string; text?: string }> {
   // 空路径直接视为非法（模型偶尔会传空串）
   if (typeof p !== "string" || p.trim().length === 0) {
     return { ok: false, text: "路径为空：请提供文件路径参数" };
   }
   // 围栏解析（纯字符串级，不触发 IO）
   const { abs, outside } = ctx.policy.resolvePath(p);
+  // 三档安全：工作区内写入在 read-only 档被禁（authorizePath 内部已判，这里给出模式感知的提示）
+  if (!outside && kind === "write" && ctx.policy.mode === "read-only") {
+    return { ok: false, text: `read-only 模式禁止写入文件：${abs}。如需修改，请用 --security workspace-write（或 danger-full-access）重新启动会话。` };
+  }
   // 工作区外需要授权；authorizePath 内部已做串行确认
   if (outside) {
     // 未获授权：返回拒绝文本（作为观察值回填，让模型换路径或向用户说明）
-    const allowed = await ctx.policy.authorizePath(abs);
+    const allowed = await ctx.policy.authorizePath(abs, kind);
     if (!allowed) {
-      return { ok: false, text: `权限策略拒绝访问工作区外路径：${abs}（用户未授权）。请改用工作区内路径，或在回答中告知用户。` };
+      // 模式感知的拒绝原因（read-only 是策略拒绝，其余是用户未授权）
+      const reason = ctx.policy.mode === "read-only"
+        ? (kind === "write" ? "read-only 模式禁止写入" : "read-only 模式禁止访问工作区外路径")
+        : "用户未授权";
+      return { ok: false, text: `权限策略拒绝访问 ${abs}（${reason}）。请改用工作区内路径，或在回答中告知用户。` };
     }
   }
   return { ok: true, abs };

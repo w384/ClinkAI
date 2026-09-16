@@ -1,7 +1,7 @@
 // 模型客户端：OpenAI 兼容 /chat/completions 的 SSE 流式调用 + tool calling。
 // 设计要点（规划 D2）：只认 OpenAI 兼容接口，未来换 vLLM/云模型零改动。
 // 错误策略：网络错误重试 1 次；HTTP 错误不重试（401/400 重试无意义）；
-//           超时分两段——首字节 90s（本地服务挂掉要快速失败）、整体 10 分钟（42 tok/s 下 4096 token 约 100s）。
+//           超时分两段——首字节 90s（本地服务挂掉要快速失败）、整体 30 分钟（42 tok/s 下 32768 token 约 780s，留 2×余量）。
 import type { Config } from "./config.ts";
 import type { ChatMessage, ModelResult, ToolCall, Usage } from "./types.ts";
 
@@ -24,6 +24,35 @@ export class ModelError extends Error {
     this.kind = kind;
     this.status = status;
   }
+}
+
+/**
+ * 判断一个错误是否为"上下文溢出"（prompt 超过模型窗口）。
+ * 三个条件同时满足才算溢出，避免把普通 400（参数错误等）误判成溢出而白白触发压缩：
+ *   1. 是 ModelError 且 kind=http（网络/超时不可能是溢出）；
+ *   2. 状态码在 400/413/422/500（溢出常见码；500 兜底个别后端归类不同）；
+ *   3. 错误信息含溢出关键词（llama.cpp 的 error.message 已拼进 ModelError.message）。
+ * 用于 loop 的反应式溢出恢复（DSH context-overflow 等价）。
+ * 注意：本机 llama.cpp 超窗多为"静默截断+慢 prefill"（无快速报错），那种情况没有干净错误
+ *       可 catch，主动预算（ctxBudget）才是主防线；本函数主要在换用会返回干净溢出错误的
+ *       后端（云 API 等）时生效，是跨后端的安全网。
+ */
+export function isContextOverflow(e: unknown): boolean {
+  // 只认 ModelError 的 HTTP 错误（网络/超时/协议都不是溢出）
+  if (!(e instanceof ModelError) || e.kind !== "http") {
+    return false;
+  }
+  // 溢出常见状态码；其余（401 认证、404 路由等）不可能是上下文溢出
+  if (e.status !== 400 && e.status !== 413 && e.status !== 422 && e.status !== 500) {
+    return false;
+  }
+  // 错误信息里找溢出关键词；后端措辞不可控，中英文都覆盖
+  const m = e.message.toLowerCase();
+  const keywords = [
+    "context", "length", "exceed", "window", "token", "too long", "overflow",
+    "上下文", "超限", "超过", "窗口", "长度", "溢出", "过长",
+  ];
+  return keywords.some((k) => m.includes(k));
 }
 
 /** 单次调用的运行参数 */
@@ -76,9 +105,10 @@ async function doStreamCall(
     ac.abort(new ModelError("90 秒内未收到模型服务响应（首字节超时）", "timeout", 0));
   }, 90_000);
   // 整体定时器：流式开始后继续兜底，防止半死不活的连接
+  // 上限 30 分钟：容纳 32768 token 满额输出（42 tok/s 约 780s）并留余量；健康流式连接不受影响
   const overallTimer = setTimeout(() => {
-    ac.abort(new ModelError("单次调用超过 10 分钟上限", "timeout", 0));
-  }, 600_000);
+    ac.abort(new ModelError("单次调用超过 30 分钟上限", "timeout", 0));
+  }, 1_800_000);
 
   let resp: globalThis.Response;
   try {

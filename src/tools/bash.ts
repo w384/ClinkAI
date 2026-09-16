@@ -38,9 +38,11 @@ export const bashTool: Tool = {
 
       // ── 权限闸门：白名单放行，其余确认（串行队列保证提示不交错）──
       const authorized = await ctx.policy.authorizeBash(command);
-      // 用户拒绝：把拒绝作为观察值回填（模型应换方案或向用户说明，而不是重试同命令）
+      // 拒绝：把拒绝作为观察值回填（模型应换方案或向用户说明，而不是重试同命令）
       if (!authorized) {
-        return { ok: false, text: `权限策略拒绝执行该命令（用户未授权）：${command}。请勿原样重试；如确需执行，请在回答中向用户说明理由。` };
+        // 模式感知的拒绝原因（read-only 是策略拒绝，workspace-write 是用户未授权）
+        const reason = ctx.policy.mode === "read-only" ? "read-only 模式禁止执行非白名单命令" : "用户未授权";
+        return { ok: false, text: `权限策略拒绝执行该命令（${reason}）：${command}。请勿原样重试；如确需执行，请在回答中向用户说明理由。` };
       }
 
       // 工作目录：可选；解析后必须存在

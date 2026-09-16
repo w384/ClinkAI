@@ -13,7 +13,7 @@ import { loadConfig } from "../src/config.ts";
 import type { Config } from "../src/config.ts";
 import { streamChat, listModels, ModelError } from "../src/model-client.ts";
 import { Session } from "../src/session.ts";
-import { PolicyGate } from "../src/policy.ts";
+import { PolicyGate, type SecurityMode } from "../src/policy.ts";
 import { BUILTIN_TOOLS, type Tool } from "../src/tools/registry.ts";
 import { delegateTool } from "../src/capabilities/delegate.ts";
 import { runGoal, GOAL_DEFAULT_MAX_ROUNDS } from "../src/capabilities/goal.ts";
@@ -40,6 +40,7 @@ interface CliArgs {
   apiKey?: string;
   workspace?: string;
   verbose?: boolean;
+  security?: SecurityMode;
   doctor?: boolean;
   version?: boolean;
   help?: boolean;
@@ -62,13 +63,15 @@ const HELP = `ClinkAI — 最小可行 Agent Harness（本机 + 本地 llama.cpp
   --base-url <url>      OpenAI 兼容端点（默认 http://127.0.0.1:18080/v1）
   --api-key <key>       Bearer 密钥
   --workspace <dir>     工作区根目录（默认当前目录；路径围栏边界）
+  --security <mode>     三档安全：read-only | workspace-write(默认) | danger-full-access
   -v, --verbose         展开完整思考内容
   --doctor              自检：连通性 + 模型列表 + 一次最小调用
   --version             显示版本
   --help                显示本帮助
 
 环境变量：CLINKAI_BASE_URL / CLINKAI_API_KEY / CLINKAI_MODEL /
-          CLINKAI_MAX_ROUNDS / CLINKAI_CTX_BUDGET / CLINKAI_TOOL_OUT
+          CLINKAI_MAX_ROUNDS / CLINKAI_CTX_BUDGET / CLINKAI_TOOL_OUT /
+          CLINKAI_SECURITY_MODE
 能力开关（默认全关，显式启用）：
           CLINKAI_DELEGATE=1        启用 delegate 子代理工具
           CLINKAI_TOOLS_EXT=<路径>  启用进程内扩展工具（本地 .mjs 模块）
@@ -86,7 +89,7 @@ function parseArgs(argv: string[]): CliArgs {
   // 任务片段（多个位置参数用空格拼接，支持不引号包裹的多词任务）
   const taskParts: string[] = [];
   // 需要值的 flag 集合
-  const VALUE_FLAGS = new Set(["--resume", "--goal", "--goal-rounds", "--max-rounds", "--model", "--base-url", "--api-key", "--workspace"]);
+  const VALUE_FLAGS = new Set(["--resume", "--goal", "--goal-rounds", "--max-rounds", "--model", "--base-url", "--api-key", "--workspace", "--security"]);
   // 顺序扫描
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -123,6 +126,12 @@ function parseArgs(argv: string[]): CliArgs {
         out.baseUrl = v;
       } else if (a === "--api-key") {
         out.apiKey = v;
+      } else if (a === "--security") {
+        // 安全档位：只接受三个合法值（非法值给明确错误，不静默回退）
+        if (v !== "read-only" && v !== "workspace-write" && v !== "danger-full-access") {
+          throw new CliError(`--security 取值非法："${v}"（允许：read-only / workspace-write / danger-full-access）`);
+        }
+        out.security = v as SecurityMode;
       } else {
         // --workspace
         out.workspace = v;
@@ -416,6 +425,7 @@ async function main(): Promise<void> {
     maxRounds: args.maxRounds,
     workspace: args.workspace ? path.resolve(args.workspace) : undefined,
     verbose: args.verbose,
+    securityMode: args.security,
   });
 
   // doctor 分支：自检后退出
@@ -457,8 +467,8 @@ async function main(): Promise<void> {
   // 创建/复用会话（goal 模式无顶层会话：每轮自动建独立会话文件）
   const session = args.goal ? undefined : new Session(sessionsDir, resumeFile);
 
-  // 策略闸门（工作区围栏）
-  const policy = new PolicyGate(cfg.workspace);
+  // 策略闸门（工作区围栏 + 三档安全档位）
+  const policy = new PolicyGate(cfg.workspace, cfg.securityMode);
 
   // 工具上下文：日志回调落到会话 meta 事件
   const ctx = {

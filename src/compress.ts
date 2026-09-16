@@ -68,6 +68,29 @@ const SUMMARY_PROMPT = `你是会话轨迹压缩器。把下面这段 agent 工�
 export type ArchiveResult = { ok: true; messages: ChatMessage[] } | { ok: false; error: string };
 
 /**
+ * 找到"不拆 tool 对"的安全切割下标。
+ * 安全边界条件：messages[cut] 不是 tool 结果（role !== "tool"）。
+ *   - 若 messages[cut] 是 tool 结果，说明它对应的 assistant(tool_calls) 在切割点之前，
+ *     拆开会留下"悬空 tool 调用"（模型看到有调用没有结果 / 有结果没有调用），破坏协议。
+ *   - 若 messages[cut] 不是 tool 结果，则前一条 messages[cut-1] 必然是"完整"的
+ *     （tool 结果 或 无工具调用的 assistant），归档部分干净收尾。
+ * 期望点不安全时，向前（下标减小，归档更少）找最近的安全边界——
+ * 宁可少压一点，也不拆 tool 对（保正确性优先于压缩率）。
+ * @param messages 完整消息列表（下标 0=system）
+ * @param desiredCut 期望的切割下标（保留 [desiredCut..end]）
+ * @returns 安全切割下标（>=1，保证 system 不被归档）
+ */
+export function findSafeArchiveBoundary(messages: ChatMessage[], desiredCut: number): number {
+  // 切割下标至少为 1（下标 0 是 system，永不归档）
+  let c = Math.max(1, desiredCut);
+  // 向前找最近的安全边界（该位置不是 tool 结果）
+  while (c > 1 && messages[c]?.role === "tool") {
+    c--;
+  }
+  return c;
+}
+
+/**
  * 调用模型对最旧的一批消息做归档摘要（M2 触发条件：轨迹估算超 ctxBudget）。
  * 摘要结果替换掉被压缩的消息，返回新的消息列表。
  * 失败时返回原因（内容太少/模型错误），调用方不再重试（防"压缩失败死循环"，PDF §2.7.4 熔断思想）。
@@ -78,13 +101,19 @@ export async function archiveOldest(
   keepRecent: number
 ): Promise<ArchiveResult> {
   // system 消息（下标 0）永远不参与压缩：它是冻结前缀
-  const oldestCount = messages.length - keepRecent - 1;
+  // 期望切割点：保留最近 keepRecent 条消息（切割下标 = 总长 - keepRecent）
+  const desiredCut = messages.length - keepRecent;
+  // 安全切割点：绝不把 assistant(tool_calls) 与它的 tool 结果拆开——
+  // 行业共识（PI/Codex/DSH 一致）：压缩边界必须落在"轮次边界"（下一条不是 tool 结果）。
+  const cut = findSafeArchiveBoundary(messages, desiredCut);
+  // 实际要归档的消息数（system 之后的 [1 .. cut-1]）
+  const toArchive = cut - 1;
   // 可压缩内容太少时摘要没有意义（摘要可能比原文还长）——这是正常情况，不是错误
-  if (oldestCount < 3) {
-    return { ok: false, error: `可压缩消息只有 ${Math.max(0, oldestCount)} 条（<3），轨迹尚小，无需归档` };
+  if (toArchive < 3) {
+    return { ok: false, error: `可压缩消息只有 ${Math.max(0, toArchive)} 条（<3），轨迹尚小，无需归档` };
   }
   // 取出最旧的一批，拼成纯文本（只保留对模型有意义的字段）
-  const oldest = messages.slice(1, 1 + oldestCount);
+  const oldest = messages.slice(1, cut);
   const transcript = oldest
     .map((m) => {
       // 按角色加前缀；工具调用参数一并带入（决策证据）
@@ -111,7 +140,7 @@ export async function archiveOldest(
       role: "user",
       content: `【历史轨迹摘要（系统生成，作为背景参考，其中结论已被后续轮次验证或修正时以后续为准）】\n${result.content.trim()}`,
     };
-    return { ok: true, messages: [messages[0], summaryMsg, ...messages.slice(1 + oldestCount)] };
+    return { ok: true, messages: [messages[0], summaryMsg, ...messages.slice(cut)] };
   } catch (e) {
     // 摘要失败（网络/超时/HTTP）不重试、不中断：轨迹虽长，但截断仍可用
     const msg = e instanceof Error ? e.message : String(e);

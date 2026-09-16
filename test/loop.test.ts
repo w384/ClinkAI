@@ -179,3 +179,132 @@ test("loop：调用不在会话列表里的工具 → 回填'未知工具'，且
     await server.close();
   }
 });
+
+// ── 反应式溢出恢复（DSH context-overflow 等价）：后端确认超窗 → 强制归档 → 重试本轮 ──
+// 假模型：主调用第一次返回 400 溢出错误；识别 archiveOldest 的摘要调用（提示词含"压缩器"）
+// 并返回有效摘要；重试的主调用正常收尾。用于验证"溢出→恢复→成功"与"溢出→无法压缩→优雅失败"。
+function startOverflowModel(): Promise<{ port: number; close: () => Promise<void>; state: { mainCalls: number; summaryCalls: number } }> {
+  const state = { mainCalls: 0, summaryCalls: 0 };
+  const server = http.createServer((req, res) => {
+    if (req.url !== "/v1/chat/completions") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    // 读取请求体以区分"摘要调用"与"主调用"（两者打同一端点）
+    let body = "";
+    req.on("data", (c: Buffer) => {
+      body += c.toString();
+    });
+    req.on("end", () => {
+      let parsed: { messages?: { content?: string }[] } = {};
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        // 非 JSON（理论不可达）按主调用处理
+      }
+      const first = parsed.messages?.[0]?.content ?? "";
+      const frame = (o: unknown) => `data: ${JSON.stringify(o)}\n\n`;
+      // 摘要调用：返回有效摘要（>50 字，archiveOldest 才视为成功）
+      if (first.includes("压缩器")) {
+        state.summaryCalls++;
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.write(frame({ choices: [{ delta: { content: "历史摘要：团队先后讨论并对比了方案 A 与方案 B 的优缺点，最终决定采用更轻量的方案 B，并已完成验证；约束条件是全程保持本地运行、不修改任何全局配置。" } }] }));
+        res.write(frame({ choices: [{ delta: {}, finish_reason: "stop" }] }));
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
+      // 主调用：第一次溢出（400 + context 关键词），之后成功
+      state.mainCalls++;
+      if (state.mainCalls === 1) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "context length exceeded: prompt exceeds the window", code: 400, type: "invalid_request_error" } }));
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write(frame({ choices: [{ delta: { content: "recovered-ok" } }] }));
+      res.write(frame({ choices: [{ delta: {}, finish_reason: "stop" }] }));
+      res.write("data: [DONE]\n\n");
+      res.end();
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      const addr = server.address();
+      if (typeof addr !== "object" || addr === null) throw new Error("无法取得监听端口");
+      resolve({ port: addr.port, state, close: () => new Promise<void>((r) => server.close(() => r())) });
+    });
+  });
+}
+
+test("loop：上下文溢出→强制归档→重试本轮成功（反应式恢复，DSH context-overflow 等价）", async (t) => {
+  const server = await startOverflowModel();
+  try {
+    // 足够长的继承历史，让 archiveOldest 有 ≥3 条可压缩（否则走优雅失败）
+    const inherited: ChatMessage[] = [
+      { role: "user", content: "讨论方案 A 的优缺点" },
+      { role: "assistant", content: "方案 A 可行但成本高" },
+      { role: "user", content: "决定改用方案 B" },
+      { role: "assistant", content: "方案 B 更轻量，采用" },
+      { role: "user", content: "验证方案 B" },
+      { role: "assistant", content: "验证通过" },
+    ];
+    const metaEvents: string[] = [];
+    const ctx: ToolContext = { workspace: "D:\\ws", policy: new PolicyGate("D:\\ws"), toolOutLimit: 100 };
+    const report = await runAgent({
+      task: "当前任务",
+      cfg: cfg(server.port),
+      tools: [],
+      ctx,
+      record: () => {},
+      meta: (note) => metaEvents.push(note),
+      inherited,
+      renderer: noopRenderer(),
+      system: "test-system",
+      gitBranch: "",
+    });
+    t.eq(report.status, "done", "溢出后强制归档应让重试成功收尾");
+    t.eq(report.rounds, 2, "第 1 轮溢出→恢复，第 2 轮成功");
+    t.eq(server.state.mainCalls, 2, "主调用共 2 次（首次溢出 + 重试）");
+    t.eq(server.state.summaryCalls, 1, "恢复应恰好触发一次摘要归档");
+    t.assert(metaEvents.includes("overflow-recovered"), "应留痕溢出恢复事件");
+  } finally {
+    await server.close();
+  }
+});
+
+test("loop：上下文溢出但轨迹太小无法压缩→优雅失败（不硬撑、不死循环）", async (t) => {
+  // 假模型：主调用一律返回 400 溢出错误（轨迹太小，摘要调用不会发生）
+  const server = http.createServer((req, res) => {
+    if (req.url !== "/v1/chat/completions") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "context length exceeded", code: 400 } }));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  const addr = server.address();
+  if (typeof addr !== "object" || addr === null) throw new Error("无法取得监听端口");
+  try {
+    const ctx: ToolContext = { workspace: "D:\\ws", policy: new PolicyGate("D:\\ws"), toolOutLimit: 100 };
+    const report = await runAgent({
+      task: "t",
+      cfg: cfg(addr.port),
+      tools: [],
+      ctx,
+      record: () => {},
+      meta: () => {},
+      inherited: [], // 空继承 → messages=[system,user] 共 2 条，太小无法压缩
+      renderer: noopRenderer(),
+      system: "test-system",
+      gitBranch: "",
+    });
+    t.eq(report.status, "error", "无法压缩时应优雅失败（不是死循环）");
+    t.assert((report.reason ?? "").includes("上下文溢出"), "原因应明确是上下文溢出且无法压缩");
+  } finally {
+    await new Promise<void>((r) => server.close(() => r()));
+  }
+});

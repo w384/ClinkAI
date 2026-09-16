@@ -41,7 +41,7 @@ test("loadConfig：默认值对准本机 llama.cpp", (t) => {
     t.eq(c.baseUrl, "http://127.0.0.1:18080/v1", "默认端点应为本机");
     t.eq(c.model, "qwen3.8-27b-local", "默认模型");
     t.eq(c.maxRounds, 15, "默认轮数上限");
-    t.eq(c.maxTokens, 4096, "默认每轮 token 上限（含思考）");
+    t.eq(c.maxTokens, 32768, "默认每轮 token 上限（含思考，对齐模型最大输出 32768）");
     t.eq(c.temperature, 0.3);
     t.eq(c.ctxBudget, 90000);
     t.eq(c.toolOutLimit, 8192);
@@ -64,7 +64,7 @@ test("loadConfig：非法环境变量回退默认（配置错误不炸启动）"
     t.eq(c.maxRounds, 15, "非数字回退默认");
     t.eq(c.temperature, 0.3, "越界温度回退默认");
     t.eq(c.ctxBudget, 90000, "负数预算回退默认");
-    t.eq(c.maxTokens, 4096, "0 值回退默认");
+    t.eq(c.maxTokens, 32768, "0 值回退默认");
   });
 });
 

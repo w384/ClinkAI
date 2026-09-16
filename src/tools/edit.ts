@@ -28,8 +28,8 @@ export const editTool: Tool = {
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     // 计时 + 异常兜底
     return timed(async () => {
-      // 路径解析 + 围栏授权
-      const r = await resolveInWorkspace(ctx, String(args.path));
+      // 路径解析 + 围栏授权（edit 传 write，read-only 档会拒绝）
+      const r = await resolveInWorkspace(ctx, String(args.path), "write");
       if (!r.ok || !r.abs) {
         return { ok: false, text: r.text ?? "路径解析失败" };
       }

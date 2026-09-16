@@ -10,7 +10,7 @@
 // 输出截断（finish_reason=length）：自动追加"请继续"，最多 2 次（防续写死循环）。
 import type { Config } from "./config.ts";
 import type { AgentReport, ChatMessage, LoopState, ToolCall, ToolResult, Usage } from "./types.ts";
-import { streamChat } from "./model-client.ts";
+import { streamChat, isContextOverflow } from "./model-client.ts";
 import { validateArgs, findTool } from "./tools/registry.ts";
 import type { Tool } from "./tools/registry.ts";
 import type { ToolContext } from "./policy.ts";
@@ -23,6 +23,8 @@ const REPEAT_BREAKER = 3;
 const FAILURE_BREAKER = 3;
 /** finish_reason=length 的自动续写次数上限 */
 const MAX_CONTINUATIONS = 2;
+/** 反应式上下文溢出恢复次数上限（DSH context-overflow 等价）；有界，防"溢出恢复死循环" */
+const OVERFLOW_RECOVERY_MAX = 2;
 
 /** CLI 渲染器接口（bin 层实现具体打印） */
 export interface Renderer {
@@ -93,6 +95,8 @@ export async function runAgent(opts: AgentOptions): Promise<AgentReport> {
   const failStreak = new Map<string, number>();
   // 归档摘要只允许发生一次：失败后不再重试（防"压缩失败死循环"）
   let archiveAttempted = false;
+  // 反应式溢出恢复计数：模型确认超窗→强制归档→重试；会话级有界（防"恢复死循环"）
+  let overflowRecoveries = 0;
   // 上下文估算基准：上一次模型调用返回的真实 prompt token 数 + 当时的消息数。
   // 真实计数最准（模型自己的分词器），增量部分用 estimateMessagesTokens 粗估。
   let actualPromptBaseline = 0;
@@ -181,7 +185,36 @@ export async function runAgent(opts: AgentOptions): Promise<AgentReport> {
         },
       });
     } catch (e) {
-      // 模型级错误（网络/超时/HTTP）：记录后终止（重试已在客户端层做过 1 次）
+      // ── 反应式上下文溢出恢复（DSH context-overflow 等价） ──
+      // 后端确认 prompt 超窗 → 强制归档更旧的消息 → 重试本轮（有界，防死循环）。
+      // 注意：本机 llama.cpp 超窗多为"静默截断+慢 prefill"（无快速报错），此路径主要在换用
+      //       会返回干净溢出错误的后端（云 API 等）时生效；本机主防线仍是主动预算（ctxBudget）。
+      if (isContextOverflow(e) && overflowRecoveries < OVERFLOW_RECOVERY_MAX) {
+        overflowRecoveries++;
+        // 逐次更激进：第 1 次保留 4 条近期，第 2 次只留 2 条（压得更狠，尽量降到窗口内）
+        const keepRecent = overflowRecoveries === 1 ? 4 : 2;
+        renderer.onMeta(`↻ 上下文溢出（第 ${overflowRecoveries}/${OVERFLOW_RECOVERY_MAX} 次恢复），强制归档（保留最近 ${keepRecent} 条）…`);
+        // 复用归档摘要（内部已含"不拆 tool 对"安全边界）；摘要调用是小 prompt，不会再次超窗
+        const archived = await archiveOldest(cfg, messages, keepRecent);
+        if (archived.ok) {
+          // 压缩成功：替换消息列表、重置估算基准（摘要+近期 比之前小），然后重试本轮
+          messages.length = 0;
+          messages.push(...archived.messages);
+          actualPromptBaseline = 0;
+          baselineMsgCount = 0;
+          // 已压缩过，主动归档路径不再重复触发
+          archiveAttempted = true;
+          meta("overflow-recovered", { attempt: overflowRecoveries, round });
+          renderer.onMeta(`↻ 溢出恢复：已强制归档，重试本轮。`);
+          continue; // 跳回循环顶：重算估算 → 重试模型调用（受 maxRounds 上限约束）
+        }
+        // 归档失败：优雅失败（可压缩消息不足 3 条 / 摘要调用失败）——不硬撑、不无限重试
+        const msg = e instanceof Error ? e.message : String(e);
+        meta("overflow-recover-failed", { attempt: overflowRecoveries, round, error: archived.error });
+        renderer.onMeta(`⛔ 上下文溢出且无法进一步压缩（${archived.error}）。原始错误：${msg}`);
+        return finishReport("error", `上下文溢出且无法压缩恢复：${msg}`, round, totalPrompt, totalCompletion, totalCached);
+      }
+      // 非溢出错误 / 恢复次数已耗尽：原样终止（重试已在客户端层做过 1 次网络重试）
       const msg = e instanceof Error ? e.message : String(e);
       meta("error-model", { message: msg, round });
       renderer.onMeta(`⛔ 模型调用失败：${msg}`);

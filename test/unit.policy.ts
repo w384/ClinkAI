@@ -68,3 +68,67 @@ test("authorizeBash：非白名单命令在非交互下自动拒绝（fail-safe�
   t.assert(await g.authorizeBash("echo ok"), "白名单命令应放行");
   t.assert(!(await g.authorizeBash("Remove-Item x")), "非白名单命令非 TTY 应拒绝");
 });
+
+// ── 三档安全开关（read-only < workspace-write(默认) < danger-full-access）──
+// 说明：以下均为纯逻辑分支（不触发交互确认），在 TTY / 非 TTY 下都应给出确定结果，
+//       故不依赖 process.stdin.isTTY，保证 CI 与本地行为一致。
+
+test("安全档位：默认档为 workspace-write（向后兼容既有行为）", (t) => {
+  t.eq(new PolicyGate(WS).mode, "workspace-write", "不传 mode 应默认 workspace-write");
+  t.eq(new PolicyGate(WS, "read-only").mode, "read-only", "显式传 read-only 生效");
+  t.eq(new PolicyGate(WS, "danger-full-access").mode, "danger-full-access", "显式传 danger-full-access 生效");
+});
+
+test("read-only：工作区内只读——写入拒绝、读取放行", async (t) => {
+  const g = new PolicyGate(WS, "read-only");
+  const inside = path.resolve(WS, "ok.txt");
+  t.assert(!(await g.authorizePath(inside, "write")), "read-only 工作区内写入应拒绝");
+  t.assert(await g.authorizePath(inside, "read"), "read-only 工作区内读取应放行");
+});
+
+test("read-only：工作区外无论读写一律拒绝（fail-safe）", async (t) => {
+  const g = new PolicyGate(WS, "read-only");
+  const outside = "D:\\elsewhere\\secret.txt";
+  t.assert(!(await g.authorizePath(outside, "read")), "read-only 工作区外读取应拒绝");
+  t.assert(!(await g.authorizePath(outside, "write")), "read-only 工作区外写入应拒绝");
+});
+
+test("read-only：bash 白名单放行、非白名单拒绝", async (t) => {
+  const g = new PolicyGate(WS, "read-only");
+  t.assert(await g.authorizeBash("echo ok"), "read-only 白名单只读命令应放行");
+  t.assert(!(await g.authorizeBash("Remove-Item x")), "read-only 非白名单命令应拒绝");
+  t.assert(!(await g.authorizeBash("git commit -m x")), "read-only git commit 应拒绝");
+});
+
+test("workspace-write：工作区内读写放行（默认档保持既有行为）", async (t) => {
+  const g = new PolicyGate(WS, "workspace-write");
+  const inside = path.resolve(WS, "ok.txt");
+  t.assert(await g.authorizePath(inside, "write"), "workspace-write 工作区内写入应放行");
+  t.assert(await g.authorizePath(inside, "read"), "workspace-write 工作区内读取应放行");
+});
+
+test("danger-full-access：工作区外读写与 bash 全放行（无需确认）", async (t) => {
+  const g = new PolicyGate(WS, "danger-full-access");
+  const outside = "D:\\elsewhere\\secret.txt";
+  t.assert(await g.authorizePath(outside, "read"), "danger 工作区外读取应放行");
+  t.assert(await g.authorizePath(outside, "write"), "danger 工作区外写入应放行");
+  t.assert(await g.authorizeBash("Remove-Item x"), "danger 非白名单 bash 应放行");
+  t.assert(await g.authorizeBash("echo ok"), "danger 白名单 bash 应放行");
+});
+
+test("档位单调性：同一路径/命令在三档下的放行集合递增", async (t) => {
+  // 用一个"工作区外路径 + 非白名单命令"同时刻画三档差异
+  const outside = "D:\\elsewhere\\secret.txt";
+  const ro = new PolicyGate(WS, "read-only");
+  const ww = new PolicyGate(WS, "workspace-write");
+  const da = new PolicyGate(WS, "danger-full-access");
+  // 工作区外读取：read-only 拒绝 / workspace-write 需确认（非 TTY 拒绝）/ danger 放行
+  if (!process.stdin.isTTY) {
+    t.assert(!(await ro.authorizePath(outside, "read")), "read-only 外部读拒绝");
+    t.assert(!(await ww.authorizePath(outside, "read")), "workspace-write 外部读需确认（非 TTY 拒绝）");
+    t.assert(await da.authorizePath(outside, "read"), "danger 外部读放行");
+  }
+  // 非白名单 bash：read-only 拒绝 / danger 放行（workspace-write 需确认，TTY/非 TTY 不确定，跳过）
+  t.assert(!(await ro.authorizeBash("Remove-Item x")), "read-only 非白名单 bash 拒绝");
+  t.assert(await da.authorizeBash("Remove-Item x"), "danger 非白名单 bash 放行");
+});

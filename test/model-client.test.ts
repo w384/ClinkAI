@@ -3,7 +3,7 @@
 // 全程只访问回环地址——与"本地/隐私"承诺一致。
 import http from "node:http";
 import { test } from "./harness.ts";
-import { streamChat, listModels, ModelError } from "../src/model-client.ts";
+import { streamChat, listModels, ModelError, isContextOverflow } from "../src/model-client.ts";
 import type { Config } from "../src/config.ts";
 
 /** 服务器侧请求计数（用于确定性断言"HTTP 错误不重试"，避免基于耗时的脆弱断言） */
@@ -158,4 +158,41 @@ test("ModelError：kind/status 字段可区分错误分类", async (t) => {
       t.eq(e.status, 401);
     }
   }
+});
+
+// ── isContextOverflow：溢出判定的正/负样本（纯函数，无需假服务器） ──
+// 三条件同时满足才判溢出：ModelError+http、状态码在溢出集合、信息含溢出关键词。
+test("isContextOverflow：识别各类溢出/非溢出错误", async (t) => {
+  // 正样本：HTTP 400 + "context length exceeded"（llama.cpp/OpenAI 常见措辞）
+  t.eq(
+    isContextOverflow(new ModelError("模型服务返回 HTTP 400：context length exceeded", "http", 400)),
+    true,
+    "400 + context 关键词应判为溢出"
+  );
+  t.eq(
+    isContextOverflow(new ModelError("prompt is too long: exceeds context window", "http", 413)),
+    true,
+    "413 + length/window 关键词应判为溢出"
+  );
+  t.eq(
+    isContextOverflow(new ModelError("模型服务返回 HTTP 500：上下文超限，请缩短输入", "http", 500)),
+    true,
+    "500 + 中文溢出关键词应判为溢出"
+  );
+  // 负样本：401 认证错误（状态码不在溢出集合）
+  t.eq(isContextOverflow(new ModelError("模型服务拒绝访问（401）", "http", 401)), false, "401 不是溢出");
+  // 负样本：网络错误（kind 不是 http）
+  t.eq(isContextOverflow(new ModelError("无法连接模型服务", "network", 0)), false, "网络错误不是溢出");
+  // 负样本：超时（kind 是 timeout）
+  t.eq(isContextOverflow(new ModelError("单次调用超过 30 分钟上限", "timeout", 0)), false, "超时不是溢出");
+  // 负样本：400 但无溢出关键词（参数错误等，避免误判触发压缩）
+  t.eq(
+    isContextOverflow(new ModelError("模型服务返回 HTTP 400：invalid parameter 'foo'", "http", 400)),
+    false,
+    "400 但无溢出关键词不判为溢出"
+  );
+  // 负样本：非 ModelError（普通 Error / null / undefined）
+  t.eq(isContextOverflow(new Error("boom")), false, "非 ModelError 不是溢出");
+  t.eq(isContextOverflow(null), false, "null 不是溢出");
+  t.eq(isContextOverflow(undefined), false, "undefined 不是溢出");
 });

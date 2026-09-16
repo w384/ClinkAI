@@ -27,8 +27,8 @@ export const writeTool: Tool = {
   async execute(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
     // 计时 + 异常兜底
     return timed(async () => {
-      // 路径解析 + 围栏授权（工作区外需确认）
-      const r = await resolveInWorkspace(ctx, String(args.path));
+      // 路径解析 + 围栏授权（工作区外需确认；write 传 write，read-only 档会拒绝）
+      const r = await resolveInWorkspace(ctx, String(args.path), "write");
       if (!r.ok || !r.abs) {
         return { ok: false, text: r.text ?? "路径解析失败" };
       }

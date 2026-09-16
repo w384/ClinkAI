@@ -269,7 +269,8 @@ async function handleRun(req: http.IncomingMessage, res: http.ServerResponse): P
   // 登记为运行中（删除路由据此拒绝；finally 里注销）
   activeSessions.add(path.basename(session.file));
   // 权限闸门（Web 非 TTY → confirm 自动拒绝，白名单只读命令不受影响）
-  const policy = new PolicyGate(cfg.workspace);
+  // 三档安全：与 CLI 同档（cfg.securityMode 来自 CLINKAI_SECURITY_MODE，默认 workspace-write）
+  const policy = new PolicyGate(cfg.workspace, cfg.securityMode);
   // 工具上下文
   const ctx = {
     workspace: cfg.workspace,
